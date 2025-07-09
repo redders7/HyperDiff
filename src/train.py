@@ -15,7 +15,9 @@ from transformers import (
 from datasets import load_dataset
 import utils
 from math import ceil
-
+from rouge_score import rouge_scorer
+import json
+import random
 
 def find_all_linear_names(model):
     cls = torch.nn.Linear
@@ -85,6 +87,30 @@ class LogStepDataCallback(TrainerCallback):
             f.write(f"Indices: {self.dataset_indices[self.step]}\n")
         self.step += 1
         return control
+    
+class EvaluateROUGECallback(TrainerCallback):
+    def __init__(self, eval_dataset_raw, tokenizer, output_dir):
+        self.eval_dataset_raw = eval_dataset_raw
+        self.tokenizer = tokenizer
+        self.output_dir = output_dir
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        model = kwargs["model"]
+        rouge_results = compute_rouge(model, self.tokenizer, self.eval_dataset_raw)
+
+        results_dir = os.path.join(self.output_dir, "rouge_results")
+        os.makedirs(results_dir, exist_ok=True)
+        output_path = os.path.join(results_dir, f"rouge_epoch_{int(state.epoch)}.json")
+        with open(output_path, "w") as f:
+            json.dump(rouge_results, f, indent=2)
+
+        print(f"📊 ROUGE results saved to {output_path}")
+        print("Epoch:", int(state.epoch))
+        average_rouge1_recall = sum(rouge_results['rouge1_recall'].values()) / len(rouge_results['rouge1_recall'])
+        average_rougeL_recall = sum(rouge_results['rougeL_recall'].values()) / len(rouge_results['rougeL_recall'])
+        print("Average ROUGE-1 Recall:", average_rouge1_recall)
+        print("Average ROUGE-L Recall:", average_rougeL_recall)
+        return control
 
 
 def tokenize_dataset(dataset, tokenizer, dataset_name):
@@ -122,6 +148,29 @@ def tokenize_dataset(dataset, tokenizer, dataset_name):
         remove_columns=col_names,
     )
 
+def compute_rouge(model, tokenizer, dataset):
+    model.eval()
+    input_texts = [item['question'] for item in dataset]
+    ground_truths = [item['answer_split'] for item in dataset]
+    indices = list(range(len(dataset)))
+
+    gen_outputs = []
+    for input_text in input_texts:
+        input_ids = tokenizer.encode(input_text, return_tensors='pt').to(model.device)
+        output_ids = model.generate(input_ids, max_new_tokens=50)
+        gen_text = tokenizer.decode(output_ids[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        gen_outputs.append(gen_text.strip())
+
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
+    rouge1_recall = {}
+    rougeL_recall = {}
+    for gen, gt, idx in zip(gen_outputs, ground_truths, indices):
+        scores = scorer.score(gt, gen)
+        rouge1_recall[idx] = scores['rouge1'].recall
+        rougeL_recall[idx] = scores['rougeL'].recall
+
+    return {'rouge1_recall': rouge1_recall, 'rougeL_recall': rougeL_recall}
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
@@ -135,6 +184,7 @@ if __name__ == "__main__":
     parser.add_argument("--subset", type=str, required=True)
     parser.add_argument("--split", type=str, default="forget")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dataset_size", type=int, default=-1)
     args = parser.parse_args()
     utils.set_seed(args.seed)
 
@@ -154,7 +204,23 @@ if __name__ == "__main__":
         args.subset,
         split=args.split
     )
-    tokenized_dataset = tokenize_dataset(dataset, tokenizer, args.dataset_name)
+
+    # If dataset_size is specified, sample a subset of the dataset
+    # Else, use the full dataset
+    if args.dataset_size > 0:
+        random.seed(args.seed)
+        all_indices = list(range(len(dataset)))
+        random.shuffle(all_indices)
+        sampled_indices = all_indices[:args.dataset_size]
+        dataset = dataset.select(sampled_indices)
+
+    # Split the dataset into 80% train and 20% eval (adjust as needed)
+    split_datasets = dataset.train_test_split(test_size=0.2, seed=args.seed)
+    train_dataset_raw = split_datasets['train']
+    eval_dataset_raw = split_datasets['test']
+
+    tokenized_dataset = tokenize_dataset(train_dataset_raw, tokenizer, args.dataset_name)
+    tokenized_eval_dataset = tokenize_dataset(eval_dataset_raw, tokenizer, args.dataset_name)
 
     output_dir = os.path.join("checkpoints", f"{args.dataset_name}-{args.subset}-{args.split}")
     os.makedirs(output_dir, exist_ok=True)
@@ -196,6 +262,7 @@ if __name__ == "__main__":
         callbacks=[
             SaveLoRACallback(),
             LogStepDataCallback(dataset_indices, subset_info=f"{args.dataset_name}-{args.subset}-{args.split}"),
+            EvaluateROUGECallback(eval_dataset_raw, tokenizer, output_dir),
         ],
     )
 
